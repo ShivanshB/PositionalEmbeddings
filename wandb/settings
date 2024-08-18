@@ -1,0 +1,5 @@
+[default]
+entity = positional-embeddings
+project = positional-embeddings
+base_url = https://api.wandb.ai
+
