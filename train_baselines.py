@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import torch
 import tqdm
 import wandb
@@ -14,6 +15,7 @@ from x_transformers import AutoregressiveWrapper
 vocab_size = 50257 # vocab size corresponding to gpt2 tokenizer
 max_seq_len = 512
 max_train_len = 512
+max_len_val = 2048
 n_hidden = 1024
 n_depth = 16
 n_heads = 8
@@ -35,15 +37,14 @@ def create_model(pos_emb_type):
         name=pos_emb_type,
         num_tokens=vocab_size,
         max_seq_len=max_seq_len,
-        use_abs_pos_emb = False,  # disable absolute positional embeddings
-        #TODO sinusoidal or learned?
+        use_abs_pos_emb=(pos_emb_type == 'learned'),  # disable absolute positional embeddings, 
         attn_layers=Decoder(
             dim=n_hidden,
             depth=n_depth,
             heads=n_heads,
             rotary_pos_emb=(pos_emb_type == 'rotary'),
             alibi_pos_bias=(pos_emb_type == 'alibi'),
-            disable_abs_pos_emb = True # disable absolute positional embeddings in attention layers
+            disable_abs_pos_emb=(pos_emb_type == 'learned') # disable absolute positional embeddings in attention layers
         )
     )
 
@@ -51,16 +52,16 @@ def create_model(pos_emb_type):
 models = [
     create_model('rotary'),
     create_model('alibi'),
-    create_model('no_pos')
-    #TODO  learned/sinusoidal
+    create_model('no_pos'),
+    create_model('learned')
 ]
 
 # tokenizing function
-def tokenize_function(examples):
-    return tokenizer(examples["text"], truncation=True, max_length=max_train_len)
+def tokenize_function(examples, max_length=max_train_len):
+    return tokenizer(examples["text"], truncation=True, max_length=max_length)
 
 # loading wikitext
-wikitext_dataset = load_dataset("wikitext", "wikitext-103-v1")
+wikitext_dataset = load_dataset("wikitext", "wikitext-2-v1")
 
 # remove empty samples
 filtered_dataset = wikitext_dataset.filter(lambda sample: len(sample['text'].strip()) > 0)
@@ -98,10 +99,8 @@ wikitext_dataset = WikiTextDataset(tokenized_wikitext, split='train')
 def train_model(model, train_dataset, val_dataset, num_epochs, batch_size, learning_rate):
     model = AutoregressiveWrapper(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    #TODO: schedule free adam
     
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -122,25 +121,18 @@ def train_model(model, train_dataset, val_dataset, num_epochs, batch_size, learn
             total_train_loss += loss.item()
         
         avg_train_loss = total_train_loss / len(train_dataloader)
-        
-        # validation step
-        model.eval()
-        total_val_loss = 0
-        with torch.no_grad():
-            for batch in tqdm(val_dataloader, desc="Validation"):
-                input_ids = batch['input_ids'].to(device)
-                loss = model(input_ids)
-                total_val_loss += loss.item()
-        
-        avg_val_loss = total_val_loss / len(val_dataloader)
-        
-        print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+
+        # validation
+        avg_val_loss, val_perplexity = evaluate_model(model, val_dataset) 
+       
+        print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val Perplexity: {val_perplexity:.4f}")
         
         # log to wandb
         wandb.log({
             "epoch": epoch + 1,
             "train_loss": avg_train_loss,
-            "val_loss": avg_val_loss
+            "val_loss": avg_val_loss,
+            "val_perplexity": val_perplexity
         })
 
         # save checkpoint
@@ -173,8 +165,13 @@ val_dataset = WikiTextDataset(tokenized_wikitext, split='validation')
 
 # model eval
 def evaluate_model(model, dataset):
+    # wrap if not wrapped
+    if not isinstance(model, AutoregressiveWrapper):
+        model = AutoregressiveWrapper(model)
+
     model.eval()
     total_loss = 0
+    total_tokens = 0
     dataloader = DataLoader(dataset, batch_size=32, shuffle=False)
     device = next(model.parameters()).device
     
@@ -183,7 +180,13 @@ def evaluate_model(model, dataset):
             input_ids = batch['input_ids'].to(device)
             loss = model(input_ids)
             total_loss += loss.item()
-    return total_loss / len(dataloader)
+            total_tokens += input_ids.numel()
+
+    # val statistic calculations
+    avg_loss = total_loss / total_tokens
+    perplexity = np.exp(avg_loss)
+
+    return avg_loss, perplexity
 
 # train each model on wikitext
 for model in models:
@@ -207,10 +210,16 @@ for model in models:
     
     # evaluate the model
     test_dataset = WikiTextDataset(tokenized_wikitext, split='test')
-    test_loss = evaluate_model(trained_model, test_dataset)
-    print(f"WikiText-103 Test Loss: {test_loss}")
+    test_loss, test_perplexity = evaluate_model(trained_model, test_dataset)
+
+    # print statistics
+    print(f"{model.name} test loss: {test_loss}")
+    print(f"{model.name} perplexity: {test_perplexity}")
     
     # log final test loss
-    wandb.log({"test_loss": test_loss})
+    wandb.log({
+        "test_loss": test_loss,
+        "test_perplexity": test_perplexity
+    })
 
     wandb.finish()  # finish the run for this model
