@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import glob
 from transformers import AutoTokenizer
 from tqdm import tqdm
@@ -13,18 +14,18 @@ def tokenize_and_save(input_dir, output_dir, tokenizer_name):
             text = f.read()
         tokens = tokenizer.encode(text)
         base_name = os.path.basename(txt_file)
-        output_file = os.path.join(output_dir, f"{os.path.splitext(base_name)[0]}.tokens")
-        with open(output_file, 'w') as f:
-            f.write(' '.join(map(str, tokens)))
+        output_file = os.path.join(output_dir, f"{os.path.splitext(base_name)[0]}.npy")
+        np.save(output_file, np.array(tokens, dtype=np.int32))
 
 def main():
     # params to tokenize gutenberg dataset
     base_dir = "/home/shiv/gutenberg"
+    output_dir = "/home/shiv/gutenberg-tokenized"
     tokenizer_name = "gpt2"
     
     for split in ['train', 'test', 'validation']:
         input_dir = os.path.join(base_dir, split)
-        output_dir = os.path.join(base_dir, f"{split}-tokenized-{tokenizer_name}")
+        output_dir = os.path.join(os.path.join(output_dir, tokenizer_name), split)
 
         print(f"Processing {split} split...")
         tokenize_and_save(input_dir, output_dir, tokenizer_name)
