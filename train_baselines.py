@@ -14,8 +14,8 @@ from x_transformers import AutoregressiveWrapper
 # hparams
 vocab_size = 50257 # vocab size corresponding to gpt2 tokenizer
 max_seq_len = 512
-max_train_len = 512
-max_len_val = 2048
+max_train_len = 128
+val_lengths = [128, 256, 512]
 n_hidden = 1024
 n_depth = 16
 n_heads = 8
@@ -85,12 +85,14 @@ class WikiTextDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         item = self.tokenized_dataset[idx]
         input_ids = item['input_ids'][:self.max_length]  # truncate if too long
+
+        attention_mask = [1] * len(input_ids)
+
+        # padding attention mask if necessary
         input_ids = input_ids + [0] * (self.max_length - len(input_ids))  # pad if too short
         return {
             'input_ids': torch.tensor(input_ids, dtype=torch.long)
         }
-
-        #TODO val on longer seq + wandb
 
 # create the dataset
 wikitext_dataset = WikiTextDataset(tokenized_wikitext, split='train')
