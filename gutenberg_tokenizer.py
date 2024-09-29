@@ -19,14 +19,13 @@ def tokenize_and_save(input_dir, output_dir, tokenizer_name):
 
 def main():
     # params to tokenize gutenberg dataset
-    base_dir = "gutenberg"
+    base_dir = "/home/shiv/gutenberg"
     tokenizer_name = "gpt2"
-    tokenized_dir = "tokenized-gutenberg"
     
     for split in ['train', 'test', 'validation']:
         input_dir = os.path.join(base_dir, split)
-        output_dir = os.path.join(tokenized_dir, f"{split}-tokenized-{tokenizer_name}")
-        
+        output_dir = os.path.join(base_dir, f"{split}-tokenized-{tokenizer_name}")
+
         print(f"Processing {split} split...")
         tokenize_and_save(input_dir, output_dir, tokenizer_name)
         print(f"Finished processing {split} split.")
