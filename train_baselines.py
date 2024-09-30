@@ -14,16 +14,18 @@ from x_transformers import AutoregressiveWrapper
 # hparams
 vocab_size = 50257 # vocab size corresponding to gpt2 tokenizer
 max_seq_len = 512
-max_train_len = 128
+train_len = 128
 val_lengths = [128, 256, 512]
-n_hidden = 1024
-n_depth = 16
+test_lengths = [128, 256, 512]
+n_hidden = 256 # reduced from 1024 for POC
+n_depth = 8 # reduced from 16 for POC
 n_heads = 8
-num_epochs = 100
-batch_size = 64
+num_epochs = 5 # reduced from 100 for POC
+batch_size = 64 # reduced from 64 for POC
 learning_rate = 3e-4
 checkpoint_interval =  5
 checkpoint_path = "checkpoints/experiment_1"
+data_base_dir = "/home/shiv/gutenberg-tokenized-truncated/gpt2-processed"
 
 # creating named transformer wrapper object for convenience
 class TransformerWrapperNamed(TransformerWrapper):
@@ -56,55 +58,44 @@ models = [
     create_model('learned')
 ]
 
-# tokenizing function
-def tokenize_function(examples, max_length=max_train_len):
-    return tokenizer(examples["text"], truncation=True, max_length=max_length)
-
-# loading wikitext
-wikitext_dataset = load_dataset("wikitext", "wikitext-2-v1")
-
-# remove empty samples
-filtered_dataset = wikitext_dataset.filter(lambda sample: len(sample['text'].strip()) > 0)
-
-# load gpt2 tokenizer
-tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-
-# tokenize samples
-tokenized_wikitext = filtered_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
-
-
-# dataset class
-class WikiTextDataset(torch.utils.data.Dataset):
-    def __init__(self, tokenized_dataset, split='train', max_length=max_seq_len):
-        self.tokenized_dataset = tokenized_dataset[split]
-        self.max_length = max_length
+class GutenbergDataset(torch.utils.data.Dataset):
+    def __init__(self, data_path):
+        self.data = np.load(data_path)
 
     def __len__(self):
-        return len(self.tokenized_dataset)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        item = self.tokenized_dataset[idx]
-        input_ids = item['input_ids'][:self.max_length]  # truncate if too long
+        input_ids = self.data[idx]
 
-        attention_mask = [1] * len(input_ids)
-
-        # padding attention mask if necessary
-        input_ids = input_ids + [0] * (self.max_length - len(input_ids))  # pad if too short
         return {
-            'input_ids': torch.tensor(input_ids, dtype=torch.long)
+            'input_ids': torch.tensor(input_ids, dtype=torch.long),
         }
 
-# create the dataset
-wikitext_dataset = WikiTextDataset(tokenized_wikitext, split='train')
+# lambda to make creating datasets cleaner
+g_path = lambda split, n_len: os.path.join(data_base_dir, split, f"data_{n_len}.npy")
+
+print("loading training dataset")
+# create training dataset
+train_dataset = GutenbergDataset(g_path('train', train_len))
+
+# create val datasets
+print("loading validation datasets")
+val_datasets = {val_len: GutenbergDataset(g_path('validation', val_len)) for val_len in val_lengths}
+
+# create test datasets
+print("loading test datasets")
+test_datasets = {test_len: GutenbergDataset(g_path('test', test_len)) for test_len in test_lengths}
 
 # training loop
-def train_model(model, train_dataset, val_dataset, num_epochs, batch_size, learning_rate):
+def train_model(model, train_dataset, val_datasets, num_epochs, batch_size, learning_rate):
     model = AutoregressiveWrapper(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Training on device: {device}")
     model = model.to(device)
 
     best_val_loss = float('inf')
@@ -114,7 +105,6 @@ def train_model(model, train_dataset, val_dataset, num_epochs, batch_size, learn
         total_train_loss = 0
         for batch in tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}"):
             input_ids = batch['input_ids'].to(device)
-            
             optimizer.zero_grad()
             loss = model(input_ids)
             loss.backward()
@@ -125,17 +115,25 @@ def train_model(model, train_dataset, val_dataset, num_epochs, batch_size, learn
         avg_train_loss = total_train_loss / len(train_dataloader)
 
         # validation
-        avg_val_loss, val_perplexity = evaluate_model(model, val_dataset) 
+        val_results = evaluate_model(model, val_datasets)
        
         print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val Perplexity: {val_perplexity:.4f}")
         
-        # log to wandb
-        wandb.log({
+        for length, metrics in val_results.items():
+            print(f"Val Loss ({length}): {metrics['loss']:.4f}, Val Perplexity ({length}): {metrics['perplexity']:.4f}")
+
+        # logging dictionary
+        log_dict = {
             "epoch": epoch + 1,
             "train_loss": avg_train_loss,
-            "val_loss": avg_val_loss,
-            "val_perplexity": val_perplexity
-        })
+        }
+
+        for length, metrics in val_results.items():
+            log_dict[f"val_loss_{length}"] = metrics['loss']
+            log_dict[f"val_perplexity_{length}"] = metrics['perplexity']
+        
+        # log to wandb
+        wandb.log(log_dict)
 
         # save checkpoint
         if (epoch + 1) % checkpoint_interval == 0:
@@ -144,7 +142,6 @@ def train_model(model, train_dataset, val_dataset, num_epochs, batch_size, learn
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': avg_train_loss,
-                'val_loss': avg_val_loss
             }
             checkpoint_path = f"checkpoints/{model.net.name}_epoch_{epoch+1}.pt"
             os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
@@ -160,45 +157,45 @@ def train_model(model, train_dataset, val_dataset, num_epochs, batch_size, learn
 
     return model
 
-
-# create train and validation datasets
-train_dataset = WikiTextDataset(tokenized_wikitext, split='train')
-val_dataset = WikiTextDataset(tokenized_wikitext, split='validation')
-
 # model eval
-def evaluate_model(model, dataset):
-    # wrap if not wrapped
+def evaluate_model(model, datasets):
     if not isinstance(model, AutoregressiveWrapper):
         model = AutoregressiveWrapper(model)
 
     model.eval()
-    total_loss = 0
-    total_tokens = 0
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=False)
+    results = {}
     device = next(model.parameters()).device
     
     with torch.no_grad():
-        for batch in dataloader:
-            input_ids = batch['input_ids'].to(device)
-            loss = model(input_ids)
-            total_loss += loss.item()
-            total_tokens += input_ids.numel()
+        for length, dataset in datasets.items():
+            dataloader = DataLoader(dataset, batch_size=32, shuffle=False)
+            total_loss = 0
+            total_tokens = 0
+            
+            for batch in dataloader:
+                input_ids = batch['input_ids'].to(device)
+                masks = batch['masks'].to(device)
+                loss = model(input_ids, mask=masks)
+                total_loss += loss.item()
+                total_tokens += masks.sum().item()
 
-    # val statistic calculations
-    avg_loss = total_loss / total_tokens
-    perplexity = np.exp(avg_loss)
+            avg_loss = total_loss / total_tokens
+            perplexity = np.exp(avg_loss)
+            results[length] = {"loss": avg_loss, "perplexity": perplexity}
 
-    return avg_loss, perplexity
+    return results
 
-# train each model on wikitext
+# train each model
 for model in models:
-    print(f"Training {model.name} on WikiText-103")
+    print(f"Training {model.name}")
 
     # initialize wandb
     wandb.init(project="positional-embeddings", name=model.name, config={
         "vocab_size": vocab_size,
         "max_seq_len": max_seq_len,
-        "max_train_len": max_train_len,
+        "train_len": train_len,
+        "val_lengths": val_lengths,
+        "test_lengths": test_lengths,
         "n_hidden": n_hidden,
         "n_depth": n_depth,
         "n_heads": n_heads,
@@ -208,20 +205,19 @@ for model in models:
     })
 
     wandb.watch(model)  # Watch the model to log gradients and parameters
-    trained_model = train_model(model, train_dataset, val_dataset, num_epochs=num_epochs, batch_size=batch_size, learning_rate=learning_rate)
+    trained_model = train_model(model, train_dataset, val_datasets, num_epochs=num_epochs, batch_size=batch_size, learning_rate=learning_rate)
     
-    # evaluate the model
-    test_dataset = WikiTextDataset(tokenized_wikitext, split='test')
-    test_loss, test_perplexity = evaluate_model(trained_model, test_dataset)
-
-    # print statistics
-    print(f"{model.name} test loss: {test_loss}")
-    print(f"{model.name} perplexity: {test_perplexity}")
+    # evaluate the model on test datasets
+    test_results = evaluate_model(trained_model, test_datasets)
     
-    # log final test loss
-    wandb.log({
-        "test_loss": test_loss,
-        "test_perplexity": test_perplexity
-    })
+    # print statistics and log final test results
+    for length, metrics in test_results.items():
+        print(f"{model.name} test loss ({length}): {metrics['loss']}")
+        print(f"{model.name} test perplexity ({length}): {metrics['perplexity']}")
+        
+        wandb.log({
+            f"test_loss_{length}": metrics['loss'],
+            f"test_perplexity_{length}": metrics['perplexity']
+        })
 
     wandb.finish()  # finish the run for this model
