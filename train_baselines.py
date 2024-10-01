@@ -24,6 +24,7 @@ num_epochs = 5 # reduced from 100 for POC
 batch_size = 64 # reduced from 64 for POC
 learning_rate = 3e-4
 checkpoint_interval =  5
+checkpoints = False # set to true before running main experiments
 checkpoint_path = "checkpoints/experiment_1"
 data_base_dir = "/home/shiv/gutenberg-tokenized-truncated/gpt2-processed"
 
@@ -117,7 +118,7 @@ def train_model(model, train_dataset, val_datasets, num_epochs, batch_size, lear
         # validation
         val_results = evaluate_model(model, val_datasets)
        
-        print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val Perplexity: {val_perplexity:.4f}")
+        print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}")
         
         for length, metrics in val_results.items():
             print(f"Val Loss ({length}): {metrics['loss']:.4f}, Val Perplexity ({length}): {metrics['perplexity']:.4f}")
@@ -136,7 +137,7 @@ def train_model(model, train_dataset, val_datasets, num_epochs, batch_size, lear
         wandb.log(log_dict)
 
         # save checkpoint
-        if (epoch + 1) % checkpoint_interval == 0:
+        if checkpoints and (epoch + 1) % checkpoint_interval == 0:
             checkpoint = {
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
@@ -149,8 +150,8 @@ def train_model(model, train_dataset, val_datasets, num_epochs, batch_size, lear
             wandb.save(checkpoint_path)  # Save to wandb as well
 
         # save best model
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        if checkpoints and val_results[train_len]["loss"] < best_val_loss:
+            best_val_loss = val_results[train_len]["loss"]
             best_model_path = f"checkpoints/{model.net.name}_best.pt"
             torch.save(model.state_dict(), best_model_path)
             wandb.save(best_model_path)
@@ -170,16 +171,13 @@ def evaluate_model(model, datasets):
         for length, dataset in datasets.items():
             dataloader = DataLoader(dataset, batch_size=32, shuffle=False)
             total_loss = 0
-            total_tokens = 0
             
             for batch in dataloader:
                 input_ids = batch['input_ids'].to(device)
-                masks = batch['masks'].to(device)
-                loss = model(input_ids, mask=masks)
+                loss = model(input_ids)
                 total_loss += loss.item()
-                total_tokens += masks.sum().item()
 
-            avg_loss = total_loss / total_tokens
+            avg_loss = total_loss / len(dataloader)
             perplexity = np.exp(avg_loss)
             results[length] = {"loss": avg_loss, "perplexity": perplexity}
 

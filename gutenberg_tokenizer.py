@@ -6,8 +6,8 @@ from tqdm import tqdm
 
 # limit on number of .txt files to tokenize for sake of runtime/memory
 # set to None to use whole dataset
-file_percent_limit = 1 # using only one percent of the total dataset
-min_files = 20 # minimum number of files
+file_percent_limit = .001 # using only one percent of the total dataset
+min_files = 2 # minimum number of files
 
 def tokenize_and_save(input_dir, output_dir, tokenizer_name):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
@@ -15,7 +15,7 @@ def tokenize_and_save(input_dir, output_dir, tokenizer_name):
     txt_files = glob.glob(os.path.join(input_dir, "*.txt"))
 
     if file_percent_limit:
-        n_truncate = max(int(len(txt_files) * (file_percent_limit/100.0)), 20)
+        n_truncate = max(int(len(txt_files) * (file_percent_limit/100.0)), min_files)
         txt_files = txt_files[:n_truncate]
     
     for txt_file in tqdm(txt_files, desc=f"Tokenizing files in {input_dir}"):
