@@ -25,38 +25,166 @@ batch_size = 64 # reduced from 64 for POC
 learning_rate = 3e-4
 checkpoint_interval =  5
 checkpoints = False # set to true before running main experiments
+sigma = 0.1 # for stop positional embeddings
 checkpoint_path = "checkpoints/experiment_1"
 data_base_dir = "/home/shiv/gutenberg-tokenized-truncated/gpt2-processed"
 
+class StochasticPositionalEmbedding(nn.Module): # currently implemented on top of learned positional embeddings
+    def __init__(self, token_embedding, dim, max_seq_len=512, sigma=0.1):
+        """
+        Args:
+            token_embedding (nn.Embedding): Shared token embedding table.
+            dim (int): Embedding dimension.
+            max_seq_len (int): Maximum sequence length.
+            sigma (float): Standard deviation for the noise.
+        """
+        super().__init__()
+        self.token_embedding = token_embedding  # Shared token embedding
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.sigma = sigma
+
+        # Initialize learned positional embeddings
+        self.pos_emb = nn.Embedding(max_seq_len, dim)
+        self.position_ids = torch.arange(max_seq_len).unsqueeze(0)  # Shape: (1, max_seq_len)
+
+    def forward(self, batch_size):
+        """
+        Args:
+            batch_size (int): Batch size.
+
+        Returns:
+            Tensor: Positional embeddings with stochastic noise. Shape: (batch_size, max_seq_len, dim)
+        """
+        # get device from token embedding table
+        device = self.token_embedding.weight.device
+
+        # Get standard learned positional embeddings
+        pos_embeddings = self.pos_emb(self.position_ids.to(device))  # Shape: (1, max_seq_len, dim)
+        pos_embeddings = pos_embeddings.repeat(batch_size, 1, 1)  # Shape: (batch_size, max_seq_len, dim)
+
+        # Sample noise for each token
+        # Token embedding matrix shape: (n_tokens, dim)
+        # We need to sample noise per token and apply it to the embeddings
+        with torch.no_grad():
+            n_tokens, d = self.token_embedding.weight.size()
+            noise = torch.randn(n_tokens, d, device=device) * self.sigma  # Shape: (n_tokens, dim)
+            # Normalize noise per token if needed
+            # noise = noise / noise.norm(dim=1, keepdim=True)
+
+        # To apply noise based on the tokens in the batch, we need access to the input tokens
+        # However, positional embeddings are typically independent of the input tokens.
+        # Instead, we can sample a new noise vector for each position in each batch.
+
+        # Sample noise for each position in the batch
+        noise = torch.randn(batch_size, self.max_seq_len, self.dim, device=device) * self.sigma  # Shape: (batch_size, max_seq_len, dim)
+
+        # Add noise to positional embeddings
+        pos_embeddings = pos_embeddings + noise
+
+        return pos_embeddings
+
 # creating named transformer wrapper object for convenience
 class TransformerWrapperNamed(TransformerWrapper):
-    def __init__(self, name, *args, **kwargs):
+    def __init__(self, name, pos_emb_type, token_embedding, custom_pos_emb=None, *args, **kwargs):
+        """
+        Args:
+            name (str): Name of the positional embedding type.
+            pos_emb_type (str): Type of positional embedding ('rotary', 'alibi', 'no_pos', 'learned', 'stochastic').
+            token_embedding (nn.Embedding): Shared token embedding table.
+            custom_pos_emb (nn.Module, optional): Custom positional embedding module.
+        """
         super().__init__(*args, **kwargs)
         self.name = name
+        self.pos_emb_type = pos_emb_type
+        self.custom_pos_emb = custom_pos_emb
 
-# helper function to create model types
-def create_model(pos_emb_type):
-    return TransformerWrapperNamed(
+    def forward(self, tokens, **kwargs):
+        """
+        Args:
+            tokens (Tensor): Input token indices of shape (batch_size, seq_len)
+            **kwargs: Additional arguments.
+
+        Returns:
+            Tensor: Output logits of shape (batch_size, seq_len, num_tokens)
+        """
+        batch_size, seq_len = tokens.size()
+
+        # Token Embeddings
+        token_embeddings = self.token_emb(tokens)  # Shape: (batch_size, seq_len, embed_dim)
+
+        # Positional Embeddings
+        if self.pos_emb_type == 'stochastic' and self.custom_pos_emb is not None:
+            pos_embeddings = self.custom_pos_emb(batch_size)[:, :seq_len, :]  # Shape: (batch_size, seq_len, embed_dim)
+        elif self.use_abs_pos_emb:
+            positions = torch.arange(seq_len, device=tokens.device).unsqueeze(0).expand(batch_size, seq_len)
+            pos_embeddings = self.pos_emb(positions)[:, :seq_len, :]
+        else:
+            pos_embeddings = 0  # No positional embeddings
+
+        # Combine embeddings
+        x = token_embeddings + pos_embeddings  # Shape: (batch_size, seq_len, embed_dim)
+
+        # Pass through transformer layers
+        x = self.transformer(x, **kwargs)  # Shape: (batch_size, seq_len, embed_dim)
+
+
+
+def create_model(pos_emb_type, sigma=0.1):
+    """
+    Creates a Transformer model with the specified positional embedding type.
+
+    Args:
+        pos_emb_type (str): Type of positional embedding ('rotary', 'alibi', 'no_pos', 'learned', 'stochastic').
+        sigma (float): Standard deviation for stochastic positional embedding.
+
+    Returns:
+        TransformerWrapperNamed: Configured Transformer model.
+    """
+    # Initialize a shared token embedding table
+    token_embedding = nn.Embedding(vocab_size, n_hidden)
+
+    # Initialize custom positional embedding if needed
+    custom_pos_emb = None
+    if pos_emb_type == 'stop':
+        custom_pos_emb = StochasticPositionalEmbedding(
+            token_embedding=token_embedding,
+            dim=n_hidden,
+            max_seq_len=max_seq_len,
+            sigma=sigma
+        )
+
+    # Initialize the TransformerWrapperNamed with the shared token embedding
+    model = TransformerWrapperNamed(
         name=pos_emb_type,
+        pos_emb_type=pos_emb_type,
+        token_embedding=token_embedding,
+        custom_pos_emb=custom_pos_emb,
         num_tokens=vocab_size,
         max_seq_len=max_seq_len,
-        use_abs_pos_emb=(pos_emb_type == 'learned'),  # disable absolute positional embeddings, 
+        use_abs_pos_emb=(pos_emb_type == 'learned'),  # Disable absolute positional embeddings if 'learned' or 'stochastic'
         attn_layers=Decoder(
             dim=n_hidden,
             depth=n_depth,
             heads=n_heads,
             rotary_pos_emb=(pos_emb_type == 'rotary'),
             alibi_pos_bias=(pos_emb_type == 'alibi'),
-            disable_abs_pos_emb=(pos_emb_type == 'learned') # disable absolute positional embeddings in attention layers
+            disable_abs_pos_emb=True  # disable absolute positional embeddings within attention layers
         )
     )
+
+    # Share the token embedding table with the model's token embeddings
+    model.token_emb = token_embedding  # Assign the shared embedding
+
+    return model    
 
 # Create models
 models = [
     create_model('rotary'),
     create_model('alibi'),
     create_model('no_pos'),
-    create_model('learned')
+    create_model('learned'),
+    create_model('stop', sigma=sigma)
 ]
 
 class GutenbergDataset(torch.utils.data.Dataset):
