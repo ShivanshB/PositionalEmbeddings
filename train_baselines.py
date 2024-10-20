@@ -66,9 +66,9 @@ class StochasticPositionalEmbedding(nn.Module): # currently implemented on top o
         # Sample noise for each token
         # Token embedding matrix shape: (n_tokens, dim)
         # We need to sample noise per token and apply it to the embeddings
-        with torch.no_grad():
-            n_tokens, d = self.token_embedding.weight.size()
-            noise = torch.randn(n_tokens, d, device=device) * self.sigma  # Shape: (n_tokens, dim)
+        # with torch.no_grad():
+        #     n_tokens, d = self.token_embedding.weight.size()
+        #     noise = torch.randn(n_tokens, d, device=device) * self.sigma  # Shape: (n_tokens, dim)
             # Normalize noise per token if needed
             # noise = noise / noise.norm(dim=1, keepdim=True)
 
@@ -127,8 +127,6 @@ class TransformerWrapperNamed(TransformerWrapper):
 
         # Pass through transformer layers
         x = self.transformer(x, **kwargs)  # Shape: (batch_size, seq_len, embed_dim)
-
-
 
 def create_model(pos_emb_type, sigma=0.1):
     """
